@@ -193,6 +193,174 @@ class ApiTests(unittest.TestCase):
         status, _ = self.get("/nope")
         self.assertEqual(status, 404)
 
+    # -- integrity=required ------------------------------------------------------
+
+    INTEGRITY_QUERY = "x=1&y=1&width=3&height=2&integrity=required"
+    WINDOW_QUERY = "x=1&y=1&width=3&height=2"
+
+    def _signed_body(self) -> bytes:
+        pixels = list(range(12))
+        pixels[6] = -32768
+        return fits_build.build_signed_fits(
+            16,
+            4,
+            3,
+            pixels,
+            extra_cards=[
+                fits_build.card("BLANK", -32768),
+                fits_build.raw_card("BSCALE  = 0.1"),
+                fits_build.raw_card("BZERO   = 10"),
+            ],
+        )
+
+    def test_integrity_required_success(self):
+        body = self._signed_body()
+        status, payload = self.post(body, self.INTEGRITY_QUERY)
+        self.assertEqual(status, 200)
+        self.assertIs(payload["integrityVerified"], True)
+        self.assertEqual(payload["sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(
+            payload["pixels"],
+            [["10.5", None, "10.7"], ["10.9", "11", "11.1"]],
+        )
+
+    def test_astropy_signed_fixture_passes(self):
+        import os
+
+        fixture = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "data",
+            "checksum_int16.fits",
+        )
+        with open(fixture, "rb") as handle:
+            body = handle.read()
+        status, payload = self.post(body, self.INTEGRITY_QUERY)
+        self.assertEqual(status, 200, payload)
+        self.assertIs(payload["integrityVerified"], True)
+        self.assertEqual(payload["sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(
+            payload["pixels"],
+            [["10.5", None, "10.7"], ["10.9", "11", "11.1"]],
+        )
+
+    def test_integrity_omitted_stays_compatible(self):
+        # No integrity parameter: same response fields, no extra marker,
+        # and a checksum-free file is accepted exactly as before.
+        body = fits_build.build_fits(16, 4, 3, list(range(12)))
+        status, payload = self.post(body, self.WINDOW_QUERY)
+        self.assertEqual(status, 200)
+        self.assertNotIn("integrityVerified", payload)
+        self.assertIn("pixels", payload)
+
+    def test_integrity_omitted_ignores_checksums(self):
+        body = self._signed_body()
+        status, payload = self.post(body, self.WINDOW_QUERY)
+        self.assertEqual(status, 200)
+        self.assertNotIn("integrityVerified", payload)
+
+    def test_integrity_required_missing_cards_is_422(self):
+        body = fits_build.build_fits(16, 4, 3, list(range(12)))
+        status, payload = self.post(body, self.INTEGRITY_QUERY)
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+        self.assertIn("CHECKSUM", payload["error"])
+
+    def test_integrity_required_pixel_tamper_is_422(self):
+        body = bytearray(self._signed_body())
+        body[2880 + 4] ^= 0xFF
+        status, payload = self.post(bytes(body), self.INTEGRITY_QUERY)
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_required_header_tamper_is_422(self):
+        body = bytearray(self._signed_body())
+        # Rewrite a byte inside the COMMENT-less BLANK card comment area is
+        # avoided; flip a byte in the BSCALE card's trailing spaces instead.
+        offset = bytes(body).find(b"BSCALE  = 0.1")
+        body[offset + 13] = ord("9")
+        status, payload = self.post(bytes(body), self.INTEGRITY_QUERY)
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_required_duplicate_checksum_is_422(self):
+        pixels = list(range(12))
+        body = fits_build.build_fits(
+            16,
+            4,
+            3,
+            pixels,
+            extra_cards=[
+                fits_build.raw_card("CHECKSUM= '" + "a" * 16 + "'"),
+                fits_build.raw_card("CHECKSUM= '" + "b" * 16 + "'"),
+                fits_build.raw_card("DATASUM = '1'"),
+            ],
+        )
+        status, payload = self.post(body, self.INTEGRITY_QUERY)
+        self.assertEqual(status, 422)
+        self.assertIn("unique", payload["error"])
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_required_malformed_datasum_is_422(self):
+        pixels = list(range(12))
+        body = fits_build.build_signed_fits(16, 4, 3, pixels)
+        offset = bytes(body).find(b"DATASUM = '") + len("DATASUM = '")
+        body = bytearray(body)
+        body[offset] = ord("x")
+        status, payload = self.post(bytes(body), self.INTEGRITY_QUERY)
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_runs_before_window_extraction(self):
+        # A tampered file with an also-invalid window must report the
+        # integrity failure (422), never the window error (400) and never
+        # any partial result.
+        body = bytearray(self._signed_body())
+        body[2880] ^= 0x01
+        query = "x=99&y=99&width=1&height=1&integrity=required"
+        status, payload = self.post(bytes(body), query)
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_valid_then_window_checked(self):
+        body = self._signed_body()
+        query = "x=99&y=99&width=1&height=1&integrity=required"
+        status, payload = self.post(body, query)
+        self.assertEqual(status, 400)
+        self.assertNotIn("pixels", payload)
+
+    def test_invalid_integrity_value_is_400(self):
+        body = self._signed_body()
+        status, payload = self.post(
+            body, "x=0&y=0&width=1&height=1&integrity=optional"
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("integrity", payload["error"])
+
+    def test_empty_integrity_value_is_400(self):
+        body = self._signed_body()
+        status, _ = self.post(body, "x=0&y=0&width=1&height=1&integrity=")
+        self.assertEqual(status, 400)
+
+    def test_duplicate_integrity_is_400(self):
+        body = self._signed_body()
+        query = (
+            "x=0&y=0&width=1&height=1"
+            "&integrity=required&integrity=required"
+        )
+        status, _ = self.post(body, query)
+        self.assertEqual(status, 400)
+
+    def test_integrity_does_not_change_blank_bscale_bzero(self):
+        body = self._signed_body()
+        status, payload = self.post(
+            body, "x=0&y=1&width=4&height=1&integrity=required"
+        )
+        self.assertEqual(status, 200)
+        # Row 1: raw values 4,5,-32768,7 -> BLANK null, calibration exact.
+        self.assertEqual(
+            payload["pixels"], [["10.4", "10.5", None, "10.7"]]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

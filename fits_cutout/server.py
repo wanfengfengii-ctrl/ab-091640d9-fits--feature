@@ -9,6 +9,10 @@ The cutout endpoint expects the raw FITS file as the request body with
 ``Content-Type: application/fits`` (at most 16 MiB) and the zero-based
 window in the query string: ``?x=&y=&width=&height=``.  The window must
 stay inside the image and contain at most 10 000 pixels.
+
+Passing ``integrity=required`` additionally enforces the FITS 4.0
+``CHECKSUM``/``DATASUM`` over the primary HDU before any extraction; on
+success the response gains ``integrityVerified: true``.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import fits
+from . import checksum, fits
 
 MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB
 MAX_CUTOUT_PIXELS = 10_000
@@ -37,6 +41,44 @@ _INT_PARAM = re.compile(r"[+-]?\d+$")
 
 class ParamError(ValueError):
     """A query parameter is missing, duplicated, or out of range."""
+
+
+def _int_param(params: dict[str, list[str]], name: str, minimum: int) -> int:
+    raw = params.get(name)
+    if raw is None or len(raw) != 1:
+        raise ParamError(f"query parameter '{name}' is required exactly once")
+    text = raw[0]
+    if not _INT_PARAM.fullmatch(text):
+        raise ParamError(
+            f"query parameter '{name}' must be an integer, got {text!r}"
+        )
+    value = int(text)
+    if value < minimum:
+        raise ParamError(
+            f"query parameter '{name}' must be >= {minimum}, got {value}"
+        )
+    return value
+
+
+def _integrity_param(params: dict[str, list[str]]) -> bool:
+    """Parse the optional ``integrity`` query parameter.
+
+    Absent -> False (legacy behaviour, no checksum enforcement).  The only
+    accepted value is ``required``; anything else or a duplicate is a 400.
+    """
+    raw = params.get("integrity")
+    if raw is None:
+        return False
+    if len(raw) != 1:
+        raise ParamError(
+            "query parameter 'integrity' is required exactly once"
+        )
+    if raw[0] != "required":
+        raise ParamError(
+            "query parameter 'integrity' only accepts the value 'required', "
+            f"got {raw[0]!r}"
+        )
+    return True
 
 
 class BodyTooLarge(Exception):
@@ -123,6 +165,7 @@ class Handler(BaseHTTPRequestHandler):
             y = _int_param(params, "y", 0)
             width = _int_param(params, "width", 1)
             height = _int_param(params, "height", 1)
+            integrity_required = _integrity_param(params)
         except ParamError as exc:
             self._error(400, str(exc))
             return
@@ -162,6 +205,15 @@ class Handler(BaseHTTPRequestHandler):
             self._error(422, f"invalid FITS file: {exc}")
             return
 
+        if integrity_required:
+            # Verify the uploaded bytes before any window extraction so a
+            # rewritten header card or pixel byte can never reach a response.
+            try:
+                checksum.verify(body, image.header_size)
+            except checksum.ChecksumError as exc:
+                self._error(422, f"integrity check failed: {exc}")
+                return
+
         if x + width > image.width or y + height > image.height:
             self._error(
                 400,
@@ -171,17 +223,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         rows = fits.cutout_rows(image, x, y, width, height)
-        self._json(
-            200,
-            {
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-                "sha256": digest,
-                "pixels": rows,
-            },
-        )
+        payload = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "sha256": digest,
+            "pixels": rows,
+        }
+        if integrity_required:
+            payload["integrityVerified"] = True
+        self._json(200, payload)
 
     # -- request body ------------------------------------------------------
 

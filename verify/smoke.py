@@ -16,10 +16,13 @@ import time
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests"))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import fits_build  # noqa: E402
 
 BASE = os.environ.get("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "data")
 
 failures: list[str] = []
 
@@ -113,9 +116,126 @@ def main() -> int:
         str(payload.get("pixels")),
     )
 
-    # 3. Error handling: every bad input must yield a 4xx --------------------
-    valid = fits_build.build_fits(16, 4, 3, list(range(12)))
+    # 3. integrity=required: valid CHECKSUM/DATASUM --------------------------
+    signed_pixels = list(range(12))
+    signed_pixels[6] = -32768
+    signed = fits_build.build_signed_fits(
+        16,
+        4,
+        3,
+        signed_pixels,
+        extra_cards=[
+            fits_build.card("BLANK", -32768),
+            fits_build.raw_card("BSCALE  = 0.1"),
+            fits_build.raw_card("BZERO   = 10"),
+        ],
+    )
+    status, payload = post_cutout(
+        signed, "x=1&y=1&width=3&height=2&integrity=required"
+    )
+    check("integrity valid status", status == 200, f"got {status}: {payload}")
+    check(
+        "integrity valid marker",
+        payload.get("integrityVerified") is True,
+        str(payload),
+    )
+    check(
+        "integrity valid sha256 on uploaded bytes",
+        payload.get("sha256") == hashlib.sha256(signed).hexdigest(),
+        str(payload.get("sha256")),
+    )
+    check(
+        "integrity valid pixels",
+        payload.get("pixels")
+        == [["10.5", None, "10.7"], ["10.9", "11", "11.1"]],
+        str(payload.get("pixels")),
+    )
 
+    # 3b. integrity=required with an independent astropy-signed fixture ------
+    with open(os.path.join(DATA_DIR, "checksum_int16.fits"), "rb") as handle:
+        fixture = handle.read()
+    status, payload = post_cutout(
+        fixture, "x=1&y=1&width=3&height=2&integrity=required"
+    )
+    check(
+        "integrity astropy fixture accepted",
+        status == 200 and payload.get("integrityVerified") is True,
+        f"got {status}: {payload}",
+    )
+
+    # 3c. integrity=required rejects every protected-byte / card problem ----
+    unsigned = fits_build.build_fits(16, 4, 3, list(range(12)))
+    status, payload = post_cutout(
+        unsigned, "x=0&y=0&width=1&height=1&integrity=required"
+    )
+    check("integrity missing cards -> 422", status == 422, f"got {status}")
+    check(
+        "integrity failure has no pixels",
+        "pixels" not in payload,
+        str(payload),
+    )
+
+    tampered_pixel = bytearray(signed)
+    tampered_pixel[2880 + 4] ^= 0xFF
+    status, payload = post_cutout(
+        bytes(tampered_pixel),
+        "x=1&y=1&width=3&height=2&integrity=required",
+    )
+    check("integrity pixel tamper -> 422", status == 422, f"got {status}")
+    check("integrity pixel tamper no pixels", "pixels" not in payload)
+
+    tampered_header = bytearray(signed)
+    bscale_at = bytes(signed).find(b"BSCALE  = 0.1")
+    tampered_header[bscale_at + 13] = ord("9")
+    status, payload = post_cutout(
+        bytes(tampered_header),
+        "x=1&y=1&width=3&height=2&integrity=required",
+    )
+    check("integrity header tamper -> 422", status == 422, f"got {status}")
+    check("integrity header tamper no pixels", "pixels" not in payload)
+
+    duplicate = fits_build.build_fits(
+        16,
+        4,
+        3,
+        list(range(12)),
+        extra_cards=[
+            fits_build.raw_card("CHECKSUM= '" + "a" * 16 + "'"),
+            fits_build.raw_card("CHECKSUM= '" + "b" * 16 + "'"),
+            fits_build.raw_card("DATASUM = '1'"),
+        ],
+    )
+    status, _ = post_cutout(
+        duplicate, "x=0&y=0&width=1&height=1&integrity=required"
+    )
+    check("integrity duplicate card -> 422", status == 422, f"got {status}")
+
+    bad_datasum = bytearray(signed)
+    ds_at = bytes(signed).find(b"DATASUM = '") + len("DATASUM = '")
+    bad_datasum[ds_at] = ord("x")
+    status, _ = post_cutout(
+        bytes(bad_datasum),
+        "x=1&y=1&width=3&height=2&integrity=required",
+    )
+    check("integrity malformed DATASUM -> 422", status == 422, f"got {status}")
+
+    status, _ = post_cutout(
+        signed, "x=0&y=0&width=1&height=1&integrity=optional"
+    )
+    check("integrity bad param value -> 400", status == 400, f"got {status}")
+
+    # 3d. Regression: omitting integrity keeps the original behaviour -------
+    status, payload = post_cutout(
+        unsigned, "x=1&y=1&width=3&height=2"
+    )
+    check(
+        "legacy unsigned request still 200",
+        status == 200 and "integrityVerified" not in payload,
+        f"got {status}: {payload}",
+    )
+
+    # 4. Error handling: every bad input must yield a 4xx --------------------
+    valid = fits_build.build_fits(16, 4, 3, list(range(12)))
     status, _ = post_cutout(valid, "x=3&y=0&width=2&height=1")
     check("out-of-bounds window -> 4xx", 400 <= status < 500, f"got {status}")
 

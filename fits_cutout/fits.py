@@ -64,6 +64,7 @@ class FitsImage:
     bscale: Decimal
     bzero: Decimal
     pixels: tuple[int, ...]  # raw signed integers, row-major order
+    header_size: int = 0  # 2880-rounded primary header length in bytes
 
 
 def parse(data: bytes) -> FitsImage:
@@ -136,6 +137,7 @@ def parse(data: bytes) -> FitsImage:
         bscale=bscale,
         bzero=bzero,
         pixels=pixels,
+        header_size=header_size,
     )
 
 
