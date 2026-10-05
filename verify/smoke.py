@@ -2,8 +2,10 @@
 """End-to-end smoke test against a running fits-cutout service.
 
 Waits for /health, then exercises the cutout API with in-memory FITS
-files (valid and deliberately corrupt) and checks exact responses.
-Exits 0 only if every check passes.
+files (valid and deliberately corrupt) and checks exact responses,
+including CHECKSUM/DATASUM integrity verification (integrity=required)
+and regression of the legacy request shape.  Exits 0 only if every
+check passes.
 """
 
 from __future__ import annotations
@@ -139,6 +141,69 @@ def main() -> int:
     )
     status, _ = post_cutout(nan_body, "x=0&y=0&width=1&height=1")
     check("non-finite BSCALE -> 4xx", 400 <= status < 500, f"got {status}")
+
+    # 4. Integrity verification (FITS checksum convention) -------------------
+    signed = fits_build.build_fits(16, 4, 3, list(range(12)), with_checksum=True)
+    status, payload = post_cutout(
+        signed, "x=1&y=1&width=3&height=2&integrity=required"
+    )
+    check("integrity status", status == 200, f"got {status}: {payload}")
+    check(
+        "integrity flag",
+        payload.get("integrityVerified") is True,
+        str(payload),
+    )
+    check(
+        "integrity sha256",
+        payload.get("sha256") == hashlib.sha256(signed).hexdigest(),
+        str(payload.get("sha256")),
+    )
+    check(
+        "integrity pixels",
+        payload.get("pixels") == [["5", "6", "7"], ["9", "10", "11"]],
+        str(payload.get("pixels")),
+    )
+
+    # a signed file served without the parameter gets no integrity flag
+    status, payload = post_cutout(signed, "x=0&y=0&width=2&height=2")
+    check(
+        "no integrity flag without parameter",
+        status == 200 and "integrityVerified" not in payload,
+        f"got {status}: {payload}",
+    )
+
+    # one flipped pixel byte must be caught before any window is returned
+    tampered = bytearray(signed)
+    tampered[2880 + 1] ^= 0xFF
+    status, payload = post_cutout(
+        bytes(tampered), "x=0&y=0&width=2&height=2&integrity=required"
+    )
+    check("tampered data -> 422", status == 422, f"got {status}: {payload}")
+    check(
+        "tampered response has no pixels",
+        "pixels" not in payload,
+        str(payload),
+    )
+
+    # a file without checksum keywords cannot satisfy integrity=required
+    status, payload = post_cutout(
+        valid, "x=0&y=0&width=1&height=1&integrity=required"
+    )
+    check("unsigned file -> 422", status == 422, f"got {status}: {payload}")
+    check(
+        "unsigned response has no pixels",
+        "pixels" not in payload,
+        str(payload),
+    )
+
+    # regression: the same tampered file is served normally when the
+    # integrity parameter is omitted
+    status, payload = post_cutout(bytes(tampered), "x=0&y=0&width=2&height=2")
+    check(
+        "legacy request ignores checksum keywords",
+        status == 200 and "pixels" in payload,
+        f"got {status}: {payload}",
+    )
 
     if failures:
         print(f"[smoke] {len(failures)} check(s) FAILED", flush=True)

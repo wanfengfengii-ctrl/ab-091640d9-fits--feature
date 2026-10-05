@@ -9,6 +9,11 @@ The cutout endpoint expects the raw FITS file as the request body with
 ``Content-Type: application/fits`` (at most 16 MiB) and the zero-based
 window in the query string: ``?x=&y=&width=&height=``.  The window must
 stay inside the image and contain at most 10 000 pixels.
+
+Passing the optional query parameter ``integrity=required`` makes the
+service verify the CHECKSUM and DATASUM keywords of the primary HDU
+(FITS checksum convention) before extracting the window; a successful
+response then includes ``"integrityVerified": true``.
 """
 
 from __future__ import annotations
@@ -62,6 +67,18 @@ def _int_param(params: dict[str, list[str]], name: str, minimum: int) -> int:
             f"query parameter '{name}' must be >= {minimum}, got {value}"
         )
     return value
+
+
+def _integrity_param(params: dict[str, list[str]]) -> bool:
+    """Whether integrity verification was requested via the query string."""
+    raw = params.get("integrity")
+    if raw is None:
+        return False
+    if len(raw) != 1 or raw[0] != "required":
+        raise ParamError(
+            "query parameter 'integrity' may only take the value 'required'"
+        )
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -123,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             y = _int_param(params, "y", 0)
             width = _int_param(params, "width", 1)
             height = _int_param(params, "height", 1)
+            integrity = _integrity_param(params)
         except ParamError as exc:
             self._error(400, str(exc))
             return
@@ -162,6 +180,13 @@ class Handler(BaseHTTPRequestHandler):
             self._error(422, f"invalid FITS file: {exc}")
             return
 
+        if integrity:
+            try:
+                fits.verify_checksums(body, image)
+            except fits.FitsError as exc:
+                self._error(422, f"integrity verification failed: {exc}")
+                return
+
         if x + width > image.width or y + height > image.height:
             self._error(
                 400,
@@ -171,17 +196,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         rows = fits.cutout_rows(image, x, y, width, height)
-        self._json(
-            200,
-            {
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-                "sha256": digest,
-                "pixels": rows,
-            },
-        )
+        payload: dict = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            "sha256": digest,
+            "pixels": rows,
+        }
+        if integrity:
+            payload["integrityVerified"] = True
+        self._json(200, payload)
 
     # -- request body ------------------------------------------------------
 

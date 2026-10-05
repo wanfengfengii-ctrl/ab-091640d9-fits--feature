@@ -216,6 +216,215 @@ class ParseStructuralErrorTests(unittest.TestCase):
         self.assert_fits_error(data, "finite")
 
 
+class ChecksumEncodeTests(unittest.TestCase):
+    """The test helper's encoder follows the FITS checksum convention."""
+
+    def test_convention_worked_example(self):
+        # Appendix A.4 of the FITS Checksum Keyword Convention: an
+        # accumulated HDU checksum of 868229149 (0x33C0201D) encodes as
+        # the 16-character string below.
+        self.assertEqual(
+            fits_build.checksum_encode(868229149), "hcHjjc9ghcEghc9g"
+        )
+
+    def test_signed_file_accumulates_to_negative_zero(self):
+        data = fits_build.build_fits(
+            16, 4, 3, list(range(12)), with_checksum=True
+        )
+        self.assertEqual(fits.ones_complement_sum(data), 0xFFFFFFFF)
+
+    def test_signed_file_bitpix32(self):
+        data = fits_build.build_fits(
+            32, 3, 2, [1, -2, 3, -4, 5, -6], with_checksum=True
+        )
+        self.assertEqual(fits.ones_complement_sum(data), 0xFFFFFFFF)
+
+
+class VerifyChecksumsTests(unittest.TestCase):
+    def verify(self, data: bytes) -> None:
+        fits.verify_checksums(data, fits.parse(data))
+
+    def assert_integrity_error(self, data: bytes, needle: str):
+        with self.assertRaises(fits.FitsError) as ctx:
+            self.verify(data)
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_valid_signed_file_passes(self):
+        self.verify(
+            fits_build.build_fits(16, 4, 3, list(range(12)), with_checksum=True)
+        )
+
+    def test_valid_signed_file_bitpix32(self):
+        self.verify(
+            fits_build.build_fits(
+                32, 3, 2, [1, -2, 3, -4, 5, -6], with_checksum=True
+            )
+        )
+
+    def test_valid_signed_file_with_calibration_and_comment(self):
+        self.verify(
+            fits_build.build_fits(
+                16,
+                2,
+                2,
+                [1, 2, 3, 4],
+                extra_cards=[
+                    fits_build.card("BLANK", -1),
+                    fits_build.raw_card("BSCALE  = 0.1"),
+                    fits_build.raw_card("BZERO   = 10"),
+                    fits_build.card("COMMENT"),
+                ],
+                with_checksum=True,
+            )
+        )
+
+    def test_missing_keywords_rejected(self):
+        data = fits_build.build_fits(16, 1, 1, [0])
+        self.assert_integrity_error(data, "CHECKSUM keyword is missing")
+
+    def test_missing_datasum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[fits_build.card("CHECKSUM", "0" * 16)],
+        )
+        self.assert_integrity_error(data, "DATASUM keyword is missing")
+
+    def test_duplicate_checksum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[fits_build.card("CHECKSUM", "1" * 16)],
+            with_checksum=True,
+        )
+        self.assert_integrity_error(data, "duplicate CHECKSUM")
+
+    def test_duplicate_datasum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[fits_build.card("DATASUM", "0")],
+            with_checksum=True,
+        )
+        self.assert_integrity_error(data, "duplicate DATASUM")
+
+    def test_short_checksum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.card("CHECKSUM", "abc"),
+                fits_build.card("DATASUM", "0"),
+            ],
+        )
+        self.assert_integrity_error(data, "16-character")
+
+    def test_punctuation_checksum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.card("CHECKSUM", "c?jjc?ghc?jjc?gh"),
+                fits_build.card("DATASUM", "0"),
+            ],
+        )
+        self.assert_integrity_error(data, "alphanumeric")
+
+    def test_unquoted_checksum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.raw_card("CHECKSUM= 0000000000000000"),
+                fits_build.card("DATASUM", "0"),
+            ],
+        )
+        self.assert_integrity_error(data, "character string")
+
+    def test_non_numeric_datasum_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.card("CHECKSUM", "a" * 16),
+                fits_build.card("DATASUM", "12.5"),
+            ],
+        )
+        self.assert_integrity_error(data, "decimal")
+
+    def test_datasum_out_of_range_rejected(self):
+        data = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.card("CHECKSUM", "a" * 16),
+                fits_build.card("DATASUM", "4294967296"),
+            ],
+        )
+        self.assert_integrity_error(data, "32-bit")
+
+    def test_pixel_tamper_detected(self):
+        data = bytearray(
+            fits_build.build_fits(16, 4, 3, list(range(12)), with_checksum=True)
+        )
+        data[2880 + 1] ^= 0xFF  # low byte of the first pixel
+        self.assert_integrity_error(bytes(data), "DATASUM mismatch")
+
+    def test_data_padding_tamper_detected(self):
+        # the zero padding of the data records is protected as well
+        original = fits_build.build_fits(
+            16, 4, 3, list(range(12)), with_checksum=True
+        )
+        image = fits.parse(original)
+        tampered = bytearray(original)
+        tampered[2880 + 24] ^= 0x01  # first padding byte after 12 pixels
+        with self.assertRaises(fits.FitsError) as ctx:
+            fits.verify_checksums(bytes(tampered), image)
+        self.assertIn("DATASUM mismatch", str(ctx.exception))
+
+    def test_header_comment_tamper_detected(self):
+        data = bytearray(
+            fits_build.build_fits(
+                16,
+                1,
+                1,
+                [0],
+                extra_cards=[fits_build.card("COMMENT")],
+                with_checksum=True,
+            )
+        )
+        data[5 * 80 + 12] = ord("X")  # inside the COMMENT card text
+        self.assert_integrity_error(bytes(data), "CHECKSUM mismatch")
+
+    def test_checksum_value_tamper_detected(self):
+        data = bytearray(fits_build.build_fits(16, 1, 1, [0], with_checksum=True))
+        at = bytes(data).find(b"CHECKSUM= '") + 11
+        data[at] = ord("A") if data[at] != ord("A") else ord("B")
+        self.assert_integrity_error(bytes(data), "CHECKSUM mismatch")
+
+    def test_datasum_value_tamper_detected(self):
+        data = bytearray(fits_build.build_fits(16, 1, 1, [0], with_checksum=True))
+        at = bytes(data).find(b"DATASUM = '") + 11
+        data[at] = ord("9") if data[at] != ord("9") else ord("8")
+        self.assert_integrity_error(bytes(data), "DATASUM mismatch")
+
+
 class CutoutTests(unittest.TestCase):
     def test_blank_pixels_become_none(self):
         img = make_image(

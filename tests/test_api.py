@@ -183,6 +183,124 @@ class ApiTests(unittest.TestCase):
         status, _ = self.post(bad, "x=0&y=0&width=1&height=1")
         self.assertEqual(status, 422)
 
+    # -- integrity=required ---------------------------------------------------
+
+    def test_integrity_required_success(self):
+        body = fits_build.build_fits(
+            16, 4, 3, list(range(12)), with_checksum=True
+        )
+        status, payload = self.post(
+            body, "x=1&y=1&width=3&height=2&integrity=required"
+        )
+        self.assertEqual(status, 200)
+        self.assertIs(payload["integrityVerified"], True)
+        self.assertEqual(payload["sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(
+            payload["pixels"], [["5", "6", "7"], ["9", "10", "11"]]
+        )
+
+    def test_integrity_flag_absent_without_param(self):
+        body = fits_build.build_fits(16, 2, 2, [1, 2, 3, 4], with_checksum=True)
+        status, payload = self.post(body, "x=0&y=0&width=2&height=2")
+        self.assertEqual(status, 200)
+        self.assertNotIn("integrityVerified", payload)
+
+    def test_integrity_unsigned_file_is_422(self):
+        body = fits_build.build_fits(16, 4, 3, list(range(12)))
+        status, payload = self.post(
+            body, "x=0&y=0&width=1&height=1&integrity=required"
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+        self.assertIn("CHECKSUM", payload["error"])
+
+    def test_integrity_tampered_pixel_is_422(self):
+        body = bytearray(
+            fits_build.build_fits(16, 4, 3, list(range(12)), with_checksum=True)
+        )
+        body[2880 + 1] ^= 0xFF
+        status, payload = self.post(
+            bytes(body), "x=0&y=0&width=2&height=2&integrity=required"
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+        self.assertIn("DATASUM", payload["error"])
+
+    def test_integrity_tampered_header_is_422(self):
+        body = bytearray(
+            fits_build.build_fits(
+                16,
+                1,
+                1,
+                [0],
+                extra_cards=[fits_build.card("COMMENT")],
+                with_checksum=True,
+            )
+        )
+        body[5 * 80 + 12] = ord("X")
+        status, payload = self.post(
+            bytes(body), "x=0&y=0&width=1&height=1&integrity=required"
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+        self.assertIn("CHECKSUM", payload["error"])
+
+    def test_integrity_duplicate_checksum_is_422(self):
+        body = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[fits_build.card("CHECKSUM", "0" * 16)],
+            with_checksum=True,
+        )
+        status, payload = self.post(
+            body, "x=0&y=0&width=1&height=1&integrity=required"
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+        self.assertIn("duplicate", payload["error"])
+
+    def test_integrity_malformed_checksum_is_422(self):
+        body = fits_build.build_fits(
+            16,
+            1,
+            1,
+            [0],
+            extra_cards=[
+                fits_build.card("CHECKSUM", "short"),
+                fits_build.card("DATASUM", "0"),
+            ],
+        )
+        status, payload = self.post(
+            body, "x=0&y=0&width=1&height=1&integrity=required"
+        )
+        self.assertEqual(status, 422)
+        self.assertNotIn("pixels", payload)
+
+    def test_integrity_invalid_value_is_400(self):
+        body = fits_build.build_fits(16, 1, 1, [0], with_checksum=True)
+        status, _ = self.post(body, "x=0&y=0&width=1&height=1&integrity=yes")
+        self.assertEqual(status, 400)
+
+    def test_integrity_duplicate_param_is_400(self):
+        body = fits_build.build_fits(16, 1, 1, [0], with_checksum=True)
+        status, _ = self.post(
+            body, "x=0&y=0&width=1&height=1&integrity=required&integrity=required"
+        )
+        self.assertEqual(status, 400)
+
+    def test_bad_checksum_ignored_without_param(self):
+        # legacy requests must not be affected by checksum keywords at all
+        body = bytearray(
+            fits_build.build_fits(16, 2, 2, [1, 2, 3, 4], with_checksum=True)
+        )
+        body[2880] ^= 0xFF
+        status, payload = self.post(bytes(body), "x=0&y=0&width=2&height=2")
+        self.assertEqual(status, 200)
+        self.assertIn("pixels", payload)
+        self.assertNotIn("integrityVerified", payload)
+
     # -- routing ----------------------------------------------------------------
 
     def test_get_on_cutout_is_405(self):
