@@ -1,0 +1,34 @@
+name: fits-cutout
+
+services:
+  app:
+    build: .
+    image: fits-cutout:local
+    environment:
+      PORT: "8000"
+    ports:
+      # Host port is configurable: HOST_PORT=9000 docker compose up app
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health',timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+
+  # One-shot verification: waits for a healthy app, then runs unit tests,
+  # the build step and the FITS API smoke test.  Its exit code reports the
+  # result: docker compose up --abort-on-container-exit --exit-code-from verify
+  verify:
+    image: fits-cutout:local
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: "http://app:8000"
+    command: ["sh", "verify/run.sh"]
